@@ -6,12 +6,12 @@ import pydeck as pdk
 import folium
 from streamlit_folium import st_folium
 from datetime import datetime, timedelta
-from sklearn.impute import SimpleImputer 
 from sklearn.compose import ColumnTransformer 
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder 
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.linear_model import LassoCV
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 # -----------------------------
 # Page Configuration
@@ -82,55 +82,98 @@ def load_county_rates():
         return pd.DataFrame()
 
 @st.cache_resource
-def train_energy_model():
-    """Train the energy consumption prediction model."""
+def train_lasso_model():
+    """Train Shohom's Lasso model (predicts avg power, then multiplies by duration)."""
     try:
         # Load charging sessions data
         df = pd.read_csv(SESSIONS_PATH)
         df['start_time'] = pd.to_datetime(df['start_time'])
         df['end_time'] = pd.to_datetime(df['end_time'])
-        df['hour_start'] = df['start_time'].dt.hour
-        df['hour_end'] = df['end_time'].dt.hour
         
-        # Prepare features and target
-        X = df[['duration_min', 'hour_start', 'hour_end', 'session_day', 'session_type']].copy()
-        y = df['energy_kWh'].copy()
+        # Keep only positive durations
+        df = df[df['end_time'] > df['start_time']].copy()
         
-        # Remove rows with missing target
-        mask = y.notna()
-        X = X[mask]
-        y = y[mask]
+        # Feature engineering (Shohom's approach)
+        df["duration_hours"] = (df['end_time'] - df['start_time']).dt.total_seconds() / 3600.0
+        df["start_hour"] = df['start_time'].dt.hour + df['start_time'].dt.minute / 60.0
         
-        # Split data
-        X_train, X_valid, y_train, y_valid = train_test_split(X, y, train_size=0.8, test_size=0.2, random_state=0)
+        # Drop extremely small durations
+        df = df[df["duration_hours"] > 1e-3].copy()
         
-        # Identify categorical and numerical columns
-        categorical_cols = [col for col in X_train.columns if X_train[col].dtype == "object"]
-        numerical_cols = [col for col in X_train.columns if X_train[col].dtype in ['int64', 'float64']]
+        # Target: average power (kW) and actual energy (kWh)
+        y_power = df['energy_kWh'].values / df["duration_hours"].values
+        y_energy = df['energy_kWh'].values
         
-        # Create preprocessors
-        numerical_transformer = SimpleImputer(strategy='constant')
-        categorical_transformer = Pipeline(steps=[
-            ('imputer', SimpleImputer(strategy='most_frequent')),
-            ('onehot', OneHotEncoder(handle_unknown='ignore'))
-        ])
+        # Features: duration_hours, start_hour, session_day, session_type
+        important_num = ["duration_hours", "start_hour"]
+        important_cat = ["session_day", "session_type"]
         
-        # Bundle preprocessing
-        preprocessor = ColumnTransformer(
-            transformers=[
-                ('num', numerical_transformer, numerical_cols),
-                ('cat', categorical_transformer, categorical_cols)
-            ])
+        X = df[important_num + important_cat].copy()
         
-        # Create and train pipeline
-        model = RandomForestRegressor(n_estimators=100, random_state=0)
-        clf = Pipeline(steps=[('preprocessor', preprocessor), ('model', model)])
-        clf.fit(X_train, y_train)
+        # Split data (keep indices for energy calculation)
+        indices = np.arange(len(df))
+        train_idx, test_idx = train_test_split(
+            indices, test_size=0.2, random_state=42, shuffle=True
+        )
         
-        return clf
+        X_train = X.iloc[train_idx]
+        X_test = X.iloc[test_idx]
+        y_power_train = y_power[train_idx]
+        y_power_test = y_power[test_idx]
+        y_energy_train = y_energy[train_idx]
+        y_energy_test = y_energy[test_idx]
+        
+        # Build preprocessing pipeline
+        transformers = [
+            ("imp_num", StandardScaler(), important_num),
+            ("imp_cat", OneHotEncoder(handle_unknown="ignore"), important_cat)
+        ]
+        
+        preprocessor = ColumnTransformer(transformers=transformers)
+        
+        # Lasso model with cross-validation
+        lasso = Pipeline(
+            steps=[
+                ("preprocess", preprocessor),
+                ("model", LassoCV(alphas=np.logspace(-3, 1, 20), cv=5, random_state=42)),
+            ]
+        )
+        
+        # Fit on average power (kW)
+        lasso.fit(X_train, y_power_train)
+        
+        # Calculate performance metrics on energy (kWh)
+        power_pred_test = lasso.predict(X_test)
+        energy_pred_test = power_pred_test * X_test["duration_hours"].values
+        
+        mae = mean_absolute_error(y_energy_test, energy_pred_test)
+        mse = mean_squared_error(y_energy_test, energy_pred_test)
+        rmse = np.sqrt(mse)
+        r2 = r2_score(y_energy_test, energy_pred_test)
+        
+        # Calculate baseline metrics (mean energy)
+        baseline_energy = np.full_like(y_energy_test, y_energy_train.mean())
+        baseline_mae = mean_absolute_error(y_energy_test, baseline_energy)
+        baseline_rmse = np.sqrt(mean_squared_error(y_energy_test, baseline_energy))
+        
+        # Store metrics
+        metrics = {
+            'mae': mae,
+            'rmse': rmse,
+            'r2': r2,
+            'baseline_mae': baseline_mae,
+            'baseline_rmse': baseline_rmse,
+            'train_size': len(X_train),
+            'test_size': len(X_test),
+            'selected_alpha': lasso.named_steps['model'].alpha_,
+            'mean_energy': y_energy_train.mean(),
+            'std_energy': y_energy_train.std()
+        }
+        
+        return lasso, metrics
     except Exception as e:
         st.error(f"Error training model: {e}")
-        return None
+        return None, None
 
 # -----------------------------
 # Helper Functions
@@ -150,33 +193,38 @@ def get_rate_from_county(county_name, county_rates_df):
         return match.iloc[0]['rate_per_kwh']
     return None
 
-def predict_charging_cost(model, duration_min, hour_start, hour_end, session_day, session_type, electricity_rate):
-    """Predict charging cost based on session parameters."""
-    # Create input dataframe
+def predict_charging_cost(model, duration_min, start_hour, session_day, session_type, electricity_rate):
+    """Predict charging cost using Shohom's Lasso model."""
+    # Convert duration to hours
+    duration_hours = duration_min / 60.0
+    
+    # Create input dataframe (Shohom's features)
     input_data = pd.DataFrame({
-        'duration_min': [duration_min],
-        'hour_start': [hour_start],
-        'hour_end': [hour_end],
+        'duration_hours': [duration_hours],
+        'start_hour': [start_hour],
         'session_day': [session_day],
         'session_type': [session_type]
     })
     
-    # Predict energy consumption
-    energy_kwh = model.predict(input_data)[0]
+    # Predict average power (kW)
+    avg_power_kw = model.predict(input_data)[0]
+    
+    # Calculate energy: power × duration
+    energy_kwh = avg_power_kw * duration_hours
     
     # Calculate cost
     cost = energy_kwh * electricity_rate
     
-    return energy_kwh, cost
+    return energy_kwh, cost, avg_power_kw
 
 # -----------------------------
 # Load Data
 # -----------------------------
-with st.spinner("Loading data and training model..."):
+with st.spinner("Loading data and training Lasso model..."):
     stations_df = load_stations()
     zip_to_county_df = load_zip_to_county()
     county_rates_df = load_county_rates()
-    model = train_energy_model()
+    model, model_metrics = train_lasso_model()
 
 if stations_df.empty or zip_to_county_df.empty or county_rates_df.empty or model is None:
     st.error("Failed to load required data. Please check data files.")
@@ -189,7 +237,7 @@ st.title("⚡ EvoCharge - California EV Charging Cost Predictor")
 st.markdown("**Predict your EV charging costs based on location, duration, and charging patterns**")
 
 # Display overall statistics
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 with col1:
     st.metric("CA Charging Stations", len(stations_df))
 with col2:
@@ -199,6 +247,9 @@ with col3:
 with col4:
     avg_rate = county_rates_df['rate_per_kwh'].mean()
     st.metric("Avg Rate ($/kWh)", f"${avg_rate:.4f}")
+with col5:
+    if model_metrics:
+        st.metric("Model MAE", f"{model_metrics['mae']:.2f} kWh")
 
 # -----------------------------
 # Sidebar - User Inputs
@@ -230,11 +281,7 @@ duration_min = st.sidebar.slider("Charging Duration (minutes)", 30, 120, 75)
 # Time of day
 current_time = datetime.now()
 start_time = st.sidebar.time_input("Start Time", value=current_time.time())
-hour_start = start_time.hour
-
-# Calculate end time based on duration
-end_datetime = current_time + timedelta(minutes=duration_min)
-hour_end = end_datetime.hour
+start_hour = start_time.hour + start_time.minute / 60.0  # Decimal hour
 
 # Day of week
 session_day = st.sidebar.selectbox("Day of Week", ["Weekday", "Weekend"])
@@ -243,28 +290,37 @@ session_day = st.sidebar.selectbox("Day of Week", ["Weekday", "Weekend"])
 session_type = st.sidebar.selectbox("Session Type", ["Regular", "Occasional", "Emergency"], 
                                     help="Session type has minimal impact on cost (~3% difference)")
 
-# Show calculated end time
-st.sidebar.write(f"Estimated End Hour: {hour_end}:00")
-
 # Model info
-with st.sidebar.expander("ℹ️ About the Model"):
-    st.markdown("""
-    **Model**: Random Forest Regressor
-    - Trees: 100
-    - Training data: 3,500 sessions
-    - MAE: ~11.64 kWh
+with st.sidebar.expander("ℹ️ Model Performance & Details"):
+    st.markdown("### Model Type")
+    st.write("**Lasso Regression** (L1-regularized)")
+    st.write("- LassoCV with 5-fold cross-validation")
+    st.write("- Predicts avg power (kW), then × duration")
     
-    **Features Used**:
-    - Duration (minutes) - MAJOR impact
-    - Start/End hour - MEDIUM impact  
-    - Day type - MINOR impact
-    - Session type - MINOR impact (~3%)
+    if model_metrics:
+        st.markdown("### Performance Metrics")
+        st.write(f"**MAE**: {model_metrics['mae']:.2f} kWh")
+        st.write(f"**RMSE**: {model_metrics['rmse']:.2f} kWh")
+        st.write(f"**R² Score**: {model_metrics['r2']:.3f}")
+        st.write(f"**Selected Alpha**: {model_metrics['selected_alpha']:.4f}")
+        
+        st.markdown("### Baseline Comparison")
+        improvement_mae = ((model_metrics['baseline_mae'] - model_metrics['mae']) / model_metrics['baseline_mae'] * 100)
+        improvement_rmse = ((model_metrics['baseline_rmse'] - model_metrics['rmse']) / model_metrics['baseline_rmse'] * 100)
+        st.write(f"**Baseline MAE**: {model_metrics['baseline_mae']:.2f} kWh")
+        st.write(f"**Improvement**: {improvement_mae:.1f}% better")
+        
+        st.markdown("### Training Data")
+        st.write(f"**Training**: {model_metrics['train_size']} sessions")
+        st.write(f"**Testing**: {model_metrics['test_size']} sessions")
+        st.write(f"**Mean Energy**: {model_metrics['mean_energy']:.2f} kWh")
+        st.write(f"**Std Dev**: {model_metrics['std_energy']:.2f} kWh")
     
-    **Historical Averages**:
-    - Regular: 42.07 kWh
-    - Occasional: 41.14 kWh  
-    - Emergency: 42.36 kWh
-    """)
+    st.markdown("### Features Used")
+    st.write("- Duration (hours) - MAJOR")
+    st.write("- Start hour - MEDIUM")
+    st.write("- Day type - MINOR")
+    st.write("- Session type - MINOR")
 
 # -----------------------------
 # Prediction Section
@@ -273,17 +329,19 @@ st.header("💰 Cost Prediction")
 
 if selected_county and selected_rate:
     # Predict
-    energy_kwh, cost_usd = predict_charging_cost(
-        model, duration_min, hour_start, hour_end, session_day, session_type, selected_rate
+    energy_kwh, cost_usd, avg_power_kw = predict_charging_cost(
+        model, duration_min, start_hour, session_day, session_type, selected_rate
     )
     
     # Display prediction
-    pred_col1, pred_col2, pred_col3 = st.columns(3)
+    pred_col1, pred_col2, pred_col3, pred_col4 = st.columns(4)
     with pred_col1:
-        st.metric("Predicted Energy Consumption", f"{energy_kwh:.2f} kWh")
+        st.metric("Predicted Energy", f"{energy_kwh:.2f} kWh")
     with pred_col2:
-        st.metric("Estimated Cost", f"${cost_usd:.2f}")
+        st.metric("Avg Charging Power", f"{avg_power_kw:.2f} kW")
     with pred_col3:
+        st.metric("Estimated Cost", f"${cost_usd:.2f}")
+    with pred_col4:
         cost_per_min = cost_usd / duration_min
         st.metric("Cost per Minute", f"${cost_per_min:.3f}")
     
@@ -293,28 +351,74 @@ if selected_county and selected_rate:
         st.write(f"**Location:** {selected_county} County, CA (ZIP: {user_zip})")
         st.write(f"**Electricity Rate:** ${selected_rate:.4f}/kWh")
         st.write(f"**Charging Duration:** {duration_min} minutes ({duration_min/60:.1f} hours)")
-        st.write(f"**Start Time:** {hour_start}:00")
+        st.write(f"**Start Time:** {start_hour:.2f} (decimal hour)")
         st.write(f"**Session Type:** {session_type} ({session_day})")
         
-        st.markdown("### Prediction")
-        st.write(f"**Energy Consumption:** {energy_kwh:.2f} kWh")
-        st.write(f"**Total Cost:** ${cost_usd:.2f}")
-        st.write(f"**Cost per kWh:** ${selected_rate:.4f}")
+        st.markdown("### Prediction (Lasso Model)")
+        st.write(f"**Average Charging Power:** {avg_power_kw:.2f} kW")
+        st.write(f"**Energy Consumption:** {energy_kwh:.2f} kWh = {avg_power_kw:.2f} kW × {duration_min/60:.2f} hours")
+        st.write(f"**Total Cost:** ${cost_usd:.2f} = {energy_kwh:.2f} kWh × ${selected_rate:.4f}/kWh")
         
         st.markdown("### Model Information")
         st.info("""
-        **Using**: Random Forest Regressor (100 trees)
+        **Using**: Lasso Regression (L1-regularized linear model)
         
-        **Note**: Session type has a small impact (~3% variation). 
-        Duration is the primary driver of energy consumption and cost.
+        **Approach**: Predicts average charging power (kW), then multiplies by duration.
+        This is more physically sound than directly predicting energy.
         
-        Historical data shows minimal difference between session types:
-        - Regular: 42.07 kWh avg
-        - Occasional: 41.14 kWh avg (-2.2%)
-        - Emergency: 42.36 kWh avg (+0.7%)
+        **Why better?**
+        - Linear relationship is interpretable
+        - L1 regularization prevents overfitting
+        - Physically meaningful predictions
         """)
 else:
     st.info("👈 Enter a valid California ZIP code to see cost predictions")
+
+# Model Performance Section
+if model_metrics:
+    with st.expander("📊 Model Performance Metrics", expanded=False):
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.markdown("### Prediction Accuracy")
+            st.metric("Mean Absolute Error (MAE)", f"{model_metrics['mae']:.2f} kWh", 
+                     help="Average prediction error")
+            st.metric("Root Mean Squared Error (RMSE)", f"{model_metrics['rmse']:.2f} kWh",
+                     help="Standard deviation of prediction errors")
+            st.metric("R² Score", f"{model_metrics['r2']:.3f}",
+                     help="Proportion of variance explained (1.0 = perfect)")
+        
+        with col2:
+            st.markdown("### Model vs Baseline")
+            improvement_mae = ((model_metrics['baseline_mae'] - model_metrics['mae']) / model_metrics['baseline_mae'] * 100)
+            improvement_rmse = ((model_metrics['baseline_rmse'] - model_metrics['rmse']) / model_metrics['baseline_rmse'] * 100)
+            
+            st.metric("Baseline MAE", f"{model_metrics['baseline_mae']:.2f} kWh",
+                     help="Simple mean prediction")
+            st.metric("MAE Improvement", f"{improvement_mae:.1f}%",
+                     delta=f"{improvement_mae:.1f}%", delta_color="normal")
+            st.metric("RMSE Improvement", f"{improvement_rmse:.1f}%",
+                     delta=f"{improvement_rmse:.1f}%", delta_color="normal")
+        
+        with col3:
+            st.markdown("### Training Details")
+            st.metric("Training Samples", f"{model_metrics['train_size']:,}")
+            st.metric("Testing Samples", f"{model_metrics['test_size']:,}")
+            st.metric("Selected Alpha (λ)", f"{model_metrics['selected_alpha']:.4f}",
+                     help="L1 regularization strength")
+        
+        st.markdown("---")
+        st.markdown("""
+        **Interpretation Guide:**
+        - **MAE** = Average error in kWh predictions (lower is better)
+        - **RMSE** = Penalizes large errors more heavily (lower is better)
+        - **R²** = How well the model explains variance (closer to 1.0 is better)
+        - **Baseline** = Simple average prediction (no ML)
+        - **Alpha** = Regularization parameter preventing overfitting
+        
+        Our Lasso model significantly outperforms the baseline, demonstrating that 
+        session characteristics (duration, time, type) provide valuable predictive power.
+        """)
 
 # -----------------------------
 # Map Visualization
@@ -589,6 +693,6 @@ st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #666;'>
     <p>Data sources: Kaggle EV Charging Stations & Sessions | California County Electricity Rates</p>
-    <p>Model: Random Forest Regressor trained on 3,500 charging sessions</p>
+    <p>Model: Lasso Regression (L1-regularized) by Shohom | Trained on 3,500 charging sessions</p>
 </div>
 """, unsafe_allow_html=True)
