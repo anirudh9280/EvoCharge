@@ -143,8 +143,9 @@ def eval_model(name, model):
     energy_pred = power_pred * X_test["duration_hours"].values    # kWh
     mae = mean_absolute_error(y_energy_test, energy_pred)
     mse = mean_squared_error(y_energy_test, energy_pred)
+    rmse = np.sqrt(mse)  # <-- added RMSE
     r2 = r2_score(y_energy_test, energy_pred)
-    print(f"{name}: MAE={mae:.3f}, MSE={mse:.3f}, R^2={r2:.3f}")
+    print(f"{name}: MAE={mae:.3f}, MSE={mse:.3f}, RMSE={rmse:.3f}, R^2={r2:.3f}")
     return energy_pred
 
 print("\nModel performance (energy_kWh):")
@@ -156,13 +157,15 @@ energy_pred_svr   = eval_model("SVR(avg_kW)", svr_best)
 # 1) mean energy baseline
 baseline_energy_mean = np.full_like(y_energy_test, y_energy_train.mean())
 mse_mean = mean_squared_error(y_energy_test, baseline_energy_mean)
-print(f"\nBaseline (mean energy): MSE={mse_mean:.3f}")
+rmse_mean = np.sqrt(mse_mean)  # <-- added
+print(f"\nBaseline (mean energy): MSE={mse_mean:.3f}, RMSE={rmse_mean:.3f}")
 
 # 2) constant-kW baseline
 baseline_kW = y_power_train.mean()
 baseline_energy_constkW = baseline_kW * X_test["duration_hours"].values
 mse_constkW = mean_squared_error(y_energy_test, baseline_energy_constkW)
-print(f"Baseline (constant avg kW): MSE={mse_constkW:.3f}")
+rmse_constkW = np.sqrt(mse_constkW)  # <-- added
+print(f"Baseline (constant avg kW): MSE={mse_constkW:.3f}, RMSE={rmse_constkW:.3f}")
 
 # write predictions for all rows
 df["kWh_pred_lasso"] = lasso.predict(X) * df["duration_hours"].values
