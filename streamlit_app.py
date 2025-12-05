@@ -279,8 +279,17 @@ st.sidebar.subheader("⚙️ Charging Session Details")
 duration_min = st.sidebar.slider("Charging Duration (minutes)", 30, 120, 75)
 
 # Time of day
-current_time = datetime.now()
-start_time = st.sidebar.time_input("Start Time", value=current_time.time())
+# Persist the user's chosen start time across reruns so it doesn't reset
+if "start_time_value" not in st.session_state:
+    default_start = datetime.now().replace(hour=15, minute=0, second=0, microsecond=0)
+    st.session_state.start_time_value = default_start.time()
+
+start_time = st.sidebar.time_input(
+    "Start Time",
+    value=st.session_state.start_time_value,
+    key="start_time_input"
+)
+st.session_state.start_time_value = start_time
 start_hour = start_time.hour + start_time.minute / 60.0  # Decimal hour
 
 # Day of week
